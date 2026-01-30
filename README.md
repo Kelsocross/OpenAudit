@@ -1,0 +1,75 @@
+# OpenAudit Platform
+
+A comprehensive freight invoice auditing platform that leverages AI to identify billing errors, recover refunds, and optimize shipping costs.
+
+## Overview
+
+OpenAudit automates the tedious process of freight invoice auditing by analyzing shipping data from carriers like FedEx to detect overcharges, late deliveries, and disputable surcharges. Built with Python and Streamlit, it processes thousands of invoices in seconds and provides actionable insights with estimated refund amounts.
+
+## Key Features
+
+- **Automated Invoice Processing** - Upload Excel exports directly from carrier billing systems
+- **AI-Powered Analysis** - GPT-5 integration for intelligent pattern recognition and recommendations
+- **Multi-Check Audit Engine** - Detects late deliveries, duplicate charges, and 40+ disputable surcharge types
+- **Smart Filing Window Tracking** - Automatically filters claims by carrier-specific filing deadlines
+- **Interactive Dashboard** - Real-time KPIs, carrier breakdowns, and trend visualizations
+- **PDF Report Generation** - Professional audit reports with executive summaries and action items
+- **Contract Benchmarking** - Compare negotiated rates against industry standards
+
+## Tech Stack
+
+| Category | Technologies |
+|----------|-------------|
+| Frontend | Streamlit, Plotly, Pandas |
+| Backend | Python 3.11, SQLite |
+| AI/ML | OpenAI GPT-5 API |
+| PDF Generation | ReportLab |
+| Data Processing | pdfplumber, tabula-py, openpyxl |
+
+## Architecture Highlights
+
+- **Zero Data Persistence** - Processes data in-memory with automatic session cleanup for privacy
+- **Configurable Business Rules** - Warehouse addresses and business indicators are parameterized, not hardcoded
+- **Modular Audit Engine** - Each audit check (late delivery, duplicates, surcharges) is independently testable
+- **Fuel Surcharge Validation** - Handles complex international shipments with multi-line invoice aggregation
+- **Intelligent Address Detection** - Pattern matching for 100+ retail chains and business indicators
+
+## Project Structure
+
+```
+├── app.py                    # Main application entry point
+├── audit_engine.py           # Core auditing logic and business rules
+├── data_validator.py         # Excel/PDF processing and validation
+├── report_generator.py       # PDF report generation with ReportLab
+├── contract_benchmarks.py    # Industry rate comparisons
+├── contract_visualization.py # Interactive contract analysis charts
+├── database.py               # SQLite data layer
+└── pages/                    # Streamlit multi-page modules
+```
+
+## Running Locally
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure environment
+export OPENAI_API_KEY=your_key_here
+
+# Start the application
+streamlit run app.py --server.port 5000
+```
+
+## Sample Audit Checks
+
+| Check Type | Description | Refund Estimate |
+|------------|-------------|-----------------|
+| Late Delivery | FedEx guaranteed services delivered past commitment | 100% of shipping cost |
+| Duplicate Tracking | Same tracking number billed multiple times | 100% of duplicate charges |
+| Residential Surcharge | Residential fees applied to business addresses | 100% of surcharge |
+| Blank Surcharge | Charges with missing descriptions | 100% of charge amount |
+| Fuel Surcharge Variance | Fuel % exceeds contracted or published rates | Variance amount |
+
+## License
+
+MIT License - See LICENSE file for details.

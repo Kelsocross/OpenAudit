@@ -1,0 +1,770 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import re
+from typing import Dict, List, Tuple, Any
+
+class FreightAuditEngine:
+    """Comprehensive freight audit engine for detecting shipping overcharges and errors"""
+    
+    def __init__(self):
+        # Standard delivery times by service description (business days)
+        self.service_delivery_times = {
+            # FedEx service descriptions (from actual user data)
+            'GROUND': 5,                                    # Ground service
+            'INTERNATIONAL_GROUND': 5,                      # International Ground
+            'FEDEX_2DAY': 2,                               # FedEx 2Day
+            'FEDEX_STANDARD_OVERNIGHT': 1,                  # FedEx Standard Overnight
+            'FEDEX_PRIORITY_OVERNIGHT': 1,                  # FedEx Priority Overnight
+            'FEDEX_ECONOMY': 3,                            # FedEx Economy
+            'GROUND_MULTIWEIGHT': 5,                        # Ground Multiweight
+            'FEDEX_INTERNATIONAL_PRIORITY': 1,              # FedEx International Priority
+            'INTERNATIONAL_PRIORITY': 1,                    # International Priority
+            'FEDEX_INTERNATIONAL_ECONOMY': 3,               # FedEx International Economy
+            'GROUND_RETURN_MANAGER': 5,                     # Ground Return Manager
+            'FEDEX_FIRST_OVERNIGHT': 1,                    # FedEx First Overnight
+            'FEDEX_INTL_PRIORITY_EXPRESS': 1,              # FedEx Intl Priority Express
+            'GROUND_NONTRANS': 5,                          # Ground NonTrans
+            
+            # Legacy mappings for backward compatibility
+            'FEDEX_GROUND': 5,
+            'FEDEX_EXPRESS_SAVER': 3,
+            'UPS_GROUND': 5,
+            'UPS_3_DAY_SELECT': 3,
+            'UPS_2ND_DAY_AIR': 2,
+            'UPS_NEXT_DAY_AIR': 1,
+            'UPS_NEXT_DAY_AIR_SAVER': 1,
+        }
+        
+        # DIM divisors by carrier
+        self.dim_divisors = {
+            'FEDEX': 139,
+            'UPS': 139
+        }
+        
+        # Common surcharge thresholds
+        self.high_surcharge_threshold = 0.25  # 25% of base rate
+        
+        # ZIP code to zone mapping (simplified - in production, use full database)
+        self.zone_mapping = self._initialize_zone_mapping()
+    
+    def _initialize_zone_mapping(self) -> Dict[str, Dict[str, int]]:
+        """Initialize simplified ZIP to zone mapping"""
+        # This is a simplified mapping - in production, use comprehensive ZIP databases
+        return {
+            'FEDEX': {
+                '10001': 2, '90210': 8, '60601': 4, '30301': 3,
+                '77001': 5, '98101': 7, '02101': 1, '33101': 6
+            },
+            'UPS': {
+                '10001': 2, '90210': 8, '60601': 4, '30301': 3,
+                '77001': 5, '98101': 7, '02101': 1, '33101': 6
+            }
+        }
+    
+    def _get_dimension(self, row: pd.Series, dimension_type: str) -> float:
+        """
+        Helper to safely extract dimension values from various possible column names.
+        Tries multiple column name variations and coerces to numeric, returning 0 if not found.
+        
+        Args:
+            row: DataFrame row
+            dimension_type: 'length', 'width', or 'height'
+        
+        Returns:
+            Numeric dimension value, or 0 if not found
+        """
+        # Define possible column name variations for each dimension
+        column_candidates = {
+            'length': ['Dimmed Length', 'Length', 'Length (in)', 'Pkg Length', 'Package Length', 'Len'],
+            'width': ['Dimmed Width', 'Width', 'Width (in)', 'Pkg Width', 'Package Width', 'Wid'],
+            'height': ['Dimmed Height', 'Height', 'Height (in)', 'Pkg Height', 'Package Height', 'Hgt']
+        }
+        
+        candidates = column_candidates.get(dimension_type.lower(), [])
+        
+        # Try each candidate column name
+        for col_name in candidates:
+            if col_name in row.index:
+                value = row[col_name]
+                # Try to convert to numeric
+                try:
+                    if pd.notna(value) and str(value).strip():
+                        numeric_val = pd.to_numeric(str(value).strip(), errors='coerce')
+                        if pd.notna(numeric_val) and numeric_val > 0:
+                            return float(numeric_val)
+                except (ValueError, TypeError):
+                    continue
+        
+        return 0.0
+    
+    def run_full_audit(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Run comprehensive freight audit on shipment data"""
+        findings = []
+        
+        # Run all audit checks
+        findings.extend(self.check_late_deliveries(df))
+        findings.extend(self.check_dim_weight_overcharges(df))
+        findings.extend(self.check_duplicate_tracking(df))
+        findings.extend(self.check_incorrect_zones(df))
+        findings.extend(self.check_address_type_mismatches(df))
+        findings.extend(self.check_high_surcharges(df))
+        findings.extend(self.check_unnecessary_surcharges(df))
+        findings.extend(self.check_disputable_surcharges(df))
+        
+        # Convert to DataFrame
+        findings_df = pd.DataFrame(findings)
+        
+        # Calculate summary
+        summary = self.calculate_summary(df, findings_df)
+        
+        return {
+            'findings': findings_df,
+            'summary': summary,
+            'audit_date': datetime.now().isoformat()
+        }
+    
+    def get_actionable_errors(self, findings_df: pd.DataFrame) -> pd.DataFrame:
+        """Filter findings to get only actionable errors suitable for refund claims"""
+        if findings_df.empty:
+            return findings_df
+        
+        # Define actionable error types that are eligible for refund claims
+        actionable_error_types = [
+            'Late Delivery',           # Service guarantee violations
+            'DIM Weight Overcharge',   # Calculation errors
+            'Duplicate Tracking',      # Billing duplicates
+            'Incorrect Zone',          # Zone misassignment
+            'Address Type Mismatch',   # Residential surcharge errors
+            'Unnecessary Surcharge',   # Standard disputable surcharges
+            'Disputable Surcharge'     # Surcharge description analysis
+        ]
+        
+        # Filter findings to include only actionable errors
+        actionable_findings = findings_df[
+            findings_df['Error Type'].isin(actionable_error_types)
+        ].copy()
+        
+        # Add claim status column for tracking
+        if not actionable_findings.empty:
+            actionable_findings['Claim Status'] = 'Ready to Submit'
+            actionable_findings['Claim Priority'] = 'Medium'
+            
+            # Set priority based on refund amount
+            high_value_threshold = 50.0
+            low_value_threshold = 10.0
+            
+            actionable_findings.loc[
+                actionable_findings['Refund Estimate'] >= high_value_threshold, 
+                'Claim Priority'
+            ] = 'High'
+            actionable_findings.loc[
+                actionable_findings['Refund Estimate'] < low_value_threshold, 
+                'Claim Priority'
+            ] = 'Low'
+        
+        return actionable_findings
+    
+    def check_late_deliveries(self, df: pd.DataFrame) -> List[Dict]:
+        """Check for late deliveries based on service type"""
+        findings = []
+        
+        for index, row in df.iterrows():
+            try:
+                # Use Service Description if available, fallback to Service Type
+                service_desc = str(row.get('Service Description', '')).upper().replace(' ', '_')
+                service_type = str(row.get('Service Type', '')).upper().replace(' ', '_')
+                carrier = str(row.get('Carrier', '')).upper()
+                
+                # Get expected delivery time - try service description first, then fallback
+                if service_desc and service_desc != 'NAN':
+                    expected_days = self.service_delivery_times.get(service_desc)
+                else:
+                    # Fallback to old method
+                    service_key = f"{carrier}_{service_type}"
+                    expected_days = self.service_delivery_times.get(service_key)
+                
+                if expected_days is None:
+                    continue
+                
+                ship_date = pd.to_datetime(row.get('Shipment Date'), errors='coerce')
+                delivery_date = pd.to_datetime(row.get('Delivery Date'), errors='coerce')
+                
+                # Skip records with invalid delivery dates (like 1900-01-01 indicating missing data)
+                if delivery_date.year < 2000:
+                    continue
+                
+                if pd.isna(ship_date) or pd.isna(delivery_date):
+                    continue
+                
+                # Calculate expected delivery date (skip weekends)
+                expected_delivery = self._add_business_days(ship_date, expected_days)
+                
+                if delivery_date > expected_delivery:
+                    days_late = (delivery_date - expected_delivery).days
+                    
+                    # Estimate refund (typically shipping cost refund for late delivery)
+                    base_rate = float(row.get('Base Rate', 0) or 0)
+                    refund_estimate = base_rate  # Full shipping refund for late delivery
+                    
+                    findings.append({
+                        'Error Type': 'Late Delivery',
+                        'Tracking Number': row.get('Tracking Number', ''),
+                        'Date': ship_date.strftime('%Y-%m-%d'),
+                        'Carrier': row.get('Carrier', ''),
+                        'Service Type': row.get('Service Type', ''),
+                        'Dispute Reason': f'Package delivered {days_late} day(s) late',
+                        'Refund Estimate': refund_estimate,
+                        'Notes': f'Expected: {expected_delivery.strftime("%Y-%m-%d")}, Actual: {delivery_date.strftime("%Y-%m-%d")}'
+                    })
+            
+            except Exception as e:
+                continue
+        
+        return findings
+    
+    def check_dim_weight_overcharges(self, df: pd.DataFrame) -> List[Dict]:
+        """Check for dimensional weight calculation errors"""
+        findings = []
+        
+        for index, row in df.iterrows():
+            try:
+                carrier = str(row.get('Carrier', '')).upper()
+                
+                # Get DIM divisor
+                if 'FEDEX' in carrier:
+                    divisor = self.dim_divisors['FEDEX']
+                elif 'UPS' in carrier:
+                    divisor = self.dim_divisors['UPS']
+                else:
+                    continue
+                
+                # Calculate actual DIM weight
+                length = float(row.get('Length', 0) or 0)
+                width = float(row.get('Width', 0) or 0)
+                height = float(row.get('Height', 0) or 0)
+                
+                if length <= 0 or width <= 0 or height <= 0:
+                    continue
+                
+                calculated_dim = (length * width * height) / divisor
+                billed_dim = float(row.get('DIM Weight', 0) or 0)
+                actual_weight = float(row.get('Actual Weight', 0) or 0)
+                
+                # Check if billed DIM is incorrect
+                if abs(calculated_dim - billed_dim) > 0.5:  # Allow 0.5 lb tolerance
+                    correct_billable_weight = max(calculated_dim, actual_weight)
+                    billed_weight = max(billed_dim, actual_weight)
+                    
+                    if correct_billable_weight < billed_weight:
+                        # Calculate refund based on weight difference
+                        base_rate = float(row.get('Base Rate', 0) or 0)
+                        total_charges = float(row.get('Total Charges', 0) or 0)
+                        
+                        # Estimate refund (proportional to weight difference)
+                        weight_diff_ratio = (billed_weight - correct_billable_weight) / billed_weight
+                        refund_estimate = total_charges * weight_diff_ratio
+                        
+                        findings.append({
+                            'Error Type': 'DIM Weight Overcharge',
+                            'Tracking Number': row.get('Tracking Number', ''),
+                            'Date': pd.to_datetime(row.get('Shipment Date'), errors='coerce').strftime('%Y-%m-%d'),
+                            'Carrier': row.get('Carrier', ''),
+                            'Service Type': row.get('Service Type', ''),
+                            'Dispute Reason': f'Incorrect DIM weight calculation',
+                            'Refund Estimate': refund_estimate,
+                            'Notes': f'Calculated: {calculated_dim:.1f} lbs, Billed: {billed_dim:.1f} lbs'
+                        })
+            
+            except Exception as e:
+                continue
+        
+        return findings
+    
+    def _normalize_tracking(self, x) -> str:
+        """Normalize tracking number: uppercase, remove spaces/hyphens"""
+        if pd.isna(x):
+            return ""
+        return str(x).strip().replace(" ", "").replace("-", "").upper()
+    
+    def _get_float_value(self, row: pd.Series, col_candidates: List[str]) -> float:
+        """Safely extract float value from row, trying multiple column name candidates"""
+        for col in col_candidates:
+            if col in row.index and pd.notna(row[col]):
+                try:
+                    val_str = str(row[col]).strip().replace('$', '').replace(',', '').replace('(', '-').replace(')', '')
+                    if val_str:
+                        return float(val_str)
+                except (ValueError, TypeError):
+                    continue
+        return 0.0
+    
+    def check_duplicate_tracking(self, df: pd.DataFrame) -> List[Dict]:
+        """
+        Production-grade duplicate tracking detection with intelligent international shipment handling.
+        
+        Rules:
+        - TRANSPORT line: freight/misc charges present, duty/tax absent
+        - DUTY_TAX line: duty/tax present, freight/misc absent  
+        - Valid paired international: exactly 1 TRANSPORT + 1 DUTY_TAX = NOT flagged
+        - Duplicate: 2+ TRANSPORT lines = flagged
+        """
+        findings = []
+        
+        if df.empty or 'Tracking Number' not in df.columns:
+            return findings
+        
+        # Tolerances
+        AMT_TOL = 0.01
+        
+        # Work with a copy
+        df_work = df.copy()
+        
+        # Normalize tracking numbers
+        df_work['_key_tracking'] = df_work['Tracking Number'].apply(self._normalize_tracking)
+        
+        # Get carrier (normalize)
+        df_work['_carrier'] = df_work['Carrier'].fillna('Unknown').astype(str).str.upper() if 'Carrier' in df_work.columns else 'Unknown'
+        
+        # Extract charge amounts from various possible column names
+        freight_candidates = ['Freight Charges', 'Base Rate', 'Freight', 'Transportation Charge']
+        misc_candidates = ['Surcharges', 'Miscellaneous Charges', 'Additional Charges', 'Misc']
+        duty_candidates = ['Duty and Tax', 'Duty & Tax', 'Duties', 'Taxes', 'Customs Charges']
+        discount_candidates = ['Discount', 'Discounts', 'Credit']
+        
+        # Calculate amounts for each row
+        freight_amts = []
+        misc_amts = []
+        duty_amts = []
+        discount_amts = []
+        net_amts = []
+        
+        for idx, row in df_work.iterrows():
+            freight = self._get_float_value(row, freight_candidates)
+            misc = self._get_float_value(row, misc_candidates)
+            duty = self._get_float_value(row, duty_candidates)
+            discount = abs(self._get_float_value(row, discount_candidates))
+            
+            # Net charge
+            net = row.get('Total Charges', 0)
+            if pd.notna(net):
+                try:
+                    net = float(str(net).replace('$', '').replace(',', ''))
+                except:
+                    net = freight + misc + duty - discount
+            else:
+                net = freight + misc + duty - discount
+            
+            freight_amts.append(freight)
+            misc_amts.append(misc)
+            duty_amts.append(duty)
+            discount_amts.append(discount)
+            net_amts.append(net)
+        
+        df_work['_freight'] = freight_amts
+        df_work['_misc'] = misc_amts
+        df_work['_duty'] = duty_amts
+        df_work['_discount'] = discount_amts
+        df_work['_net'] = net_amts
+        
+        # Classify lines
+        freight_like = df_work['_freight'] + df_work['_misc'] + df_work['_discount']
+        is_transport = (freight_like > AMT_TOL) & (df_work['_duty'].abs() < AMT_TOL)
+        is_duty_tax = (df_work['_duty'].abs() > AMT_TOL) & ((df_work['_freight'].abs() + df_work['_misc'].abs()) < AMT_TOL)
+        is_credit = (df_work['_net'] < -AMT_TOL)
+        
+        df_work['_class'] = np.select(
+            [is_transport, is_duty_tax, is_credit],
+            ['TRANSPORT', 'DUTY_TAX', 'CREDIT_ADJUST'],
+            default='MISC'
+        )
+        
+        # Group by carrier + tracking
+        df_work['_group_key'] = df_work['_carrier'] + '||' + df_work['_key_tracking']
+        
+        # Find tracking numbers that appear more than once
+        tracking_counts = df_work['_key_tracking'].value_counts()
+        duplicates = tracking_counts[tracking_counts > 1]
+        
+        if duplicates.empty:
+            return findings
+        
+        # Analyze each duplicate group
+        for tracking_num in duplicates.index:
+            if not tracking_num:  # Skip empty tracking numbers
+                continue
+                
+            duplicate_rows = df_work[df_work['_key_tracking'] == tracking_num]
+            
+            # Count line types
+            transport_rows = duplicate_rows[duplicate_rows['_class'] == 'TRANSPORT']
+            duty_tax_rows = duplicate_rows[duplicate_rows['_class'] == 'DUTY_TAX']
+            
+            num_transport = len(transport_rows)
+            num_duty_tax = len(duty_tax_rows)
+            
+            # Valid paired international: exactly 1 TRANSPORT + 1 DUTY_TAX
+            if num_transport == 1 and num_duty_tax == 1:
+                # This is VALID - don't flag
+                continue
+            
+            # Flag if multiple TRANSPORT lines
+            if num_transport > 1:
+                transport_nets = transport_rows['_net'].tolist()
+                
+                # Check if amounts are identical or different
+                unique_amounts = len(set([round(x, 2) for x in transport_nets]))
+                
+                if unique_amounts > 1:
+                    # Different amounts - likely billing error
+                    total_transport = sum(transport_nets)
+                    refund_estimate = total_transport - max(transport_nets)
+                    dispute_reason = f'Multiple freight charges ({num_transport} lines with different amounts)'
+                else:
+                    # Same amounts - duplicate billing
+                    refund_estimate = transport_nets[0] * (num_transport - 1)
+                    dispute_reason = f'Duplicate freight billing ({num_transport} identical charges)'
+                
+                # Calculate totals
+                freight_total = sum(transport_nets)
+                duty_tax_total = sum(duty_tax_rows['_net'].tolist()) if num_duty_tax > 0 else 0
+                net_landed = freight_total + duty_tax_total
+                
+                # Get first row for metadata
+                first_row = duplicate_rows.iloc[0]
+                
+                findings.append({
+                    'Error Type': 'Duplicate Tracking',
+                    'Tracking Number': first_row['Tracking Number'],
+                    'Date': pd.to_datetime(first_row.get('Shipment Date'), errors='coerce').strftime('%Y-%m-%d') if pd.notna(first_row.get('Shipment Date')) else '',
+                    'Carrier': first_row.get('Carrier', ''),
+                    'Service Type': first_row.get('Service Type', ''),
+                    'Dispute Reason': dispute_reason,
+                    'Refund Estimate': refund_estimate,
+                    'Notes': f'Transport: {num_transport}, Duty/Tax: {num_duty_tax}, Landed: ${net_landed:.2f}'
+                })
+        
+        return findings
+    
+    def check_incorrect_zones(self, df: pd.DataFrame) -> List[Dict]:
+        """Check for incorrect shipping zones"""
+        findings = []
+        
+        for index, row in df.iterrows():
+            try:
+                carrier = str(row.get('Carrier', '')).upper()
+                origin_zip = str(row.get('Origin ZIP', ''))[:5]
+                dest_zip = str(row.get('Destination ZIP', ''))[:5]
+                billed_zone = int(row.get('Zone', 0) or 0)
+                
+                # Get expected zone (simplified lookup)
+                if carrier in self.zone_mapping:
+                    expected_zone = self.zone_mapping[carrier].get(dest_zip)
+                    
+                    if expected_zone and expected_zone != billed_zone:
+                        # Estimate refund based on zone difference
+                        base_rate = float(row.get('Base Rate', 0) or 0)
+                        zone_diff = billed_zone - expected_zone
+                        
+                        if zone_diff > 0:  # Overcharged
+                            refund_estimate = base_rate * 0.1 * zone_diff  # Rough estimate
+                            
+                            findings.append({
+                                'Error Type': 'Incorrect Zone',
+                                'Tracking Number': row.get('Tracking Number', ''),
+                                'Date': pd.to_datetime(row.get('Shipment Date'), errors='coerce').strftime('%Y-%m-%d'),
+                                'Carrier': row.get('Carrier', ''),
+                                'Service Type': row.get('Service Type', ''),
+                                'Dispute Reason': f'Incorrect zone assignment',
+                                'Refund Estimate': refund_estimate,
+                                'Notes': f'Billed Zone: {billed_zone}, Correct Zone: {expected_zone}'
+                            })
+            
+            except Exception as e:
+                continue
+        
+        return findings
+    
+    def check_address_type_mismatches(self, df: pd.DataFrame) -> List[Dict]:
+        """Check for residential vs commercial address type mismatches"""
+        findings = []
+        
+        # Common business keywords
+        business_keywords = ['LLC', 'INC', 'CORP', 'COMPANY', 'BUSINESS', 'OFFICE', 'WAREHOUSE']
+        
+        for index, row in df.iterrows():
+            try:
+                address_type = str(row.get('Address Type', '')).upper()
+                dest_address = str(row.get('Destination Address', ''))
+                residential_surcharge = float(row.get('Residential Surcharge', 0) or 0)
+                
+                # Check if address contains business keywords but charged residential
+                has_business_keywords = any(keyword in dest_address.upper() for keyword in business_keywords)
+                
+                if has_business_keywords and address_type == 'RESIDENTIAL' and residential_surcharge > 0:
+                    findings.append({
+                        'Error Type': 'Address Type Mismatch',
+                        'Tracking Number': row.get('Tracking Number', ''),
+                        'Date': pd.to_datetime(row.get('Shipment Date')).strftime('%Y-%m-%d'),
+                        'Carrier': row.get('Carrier', ''),
+                        'Service Type': row.get('Service Type', ''),
+                        'Dispute Reason': 'Residential surcharge on business address',
+                        'Refund Estimate': residential_surcharge,
+                        'Notes': f'Business keywords found in address'
+                    })
+            
+            except Exception as e:
+                continue
+        
+        return findings
+    
+    def check_high_surcharges(self, df: pd.DataFrame) -> List[Dict]:
+        """Check for unusually high surcharges"""
+        findings = []
+        
+        for index, row in df.iterrows():
+            try:
+                surcharges = float(row.get('Surcharges', 0) or 0)
+                base_rate = float(row.get('Base Rate', 0) or 0)
+                
+                if base_rate > 0:
+                    surcharge_ratio = surcharges / base_rate
+                    
+                    if surcharge_ratio > self.high_surcharge_threshold:
+                        # Flag for review - potential unnecessary charges
+                        findings.append({
+                            'Error Type': 'High Surcharges',
+                            'Tracking Number': row.get('Tracking Number', ''),
+                            'Date': pd.to_datetime(row.get('Shipment Date'), errors='coerce').strftime('%Y-%m-%d'),
+                            'Carrier': row.get('Carrier', ''),
+                            'Service Type': row.get('Service Type', ''),
+                            'Dispute Reason': f'Surcharges exceed {self.high_surcharge_threshold*100}% of base rate',
+                            'Refund Estimate': surcharges * 0.5,  # Conservative estimate
+                            'Notes': f'Surcharge ratio: {surcharge_ratio:.1%}'
+                        })
+            
+            except Exception as e:
+                continue
+        
+        return findings
+    
+    def check_unnecessary_surcharges(self, df: pd.DataFrame) -> List[Dict]:
+        """Check for potentially unnecessary surcharges"""
+        findings = []
+        
+        for index, row in df.iterrows():
+            try:
+                address_correction = float(row.get('Address Correction', 0) or 0)
+                declared_value = float(row.get('Declared Value', 0) or 0)
+                declared_value_charge = float(row.get('Declared Value Charge', 0) or 0)
+                
+                # Check for address correction fees (often disputable)
+                if address_correction > 0:
+                    findings.append({
+                        'Error Type': 'Unnecessary Surcharge',
+                        'Tracking Number': row.get('Tracking Number', ''),
+                        'Date': pd.to_datetime(row.get('Shipment Date')).strftime('%Y-%m-%d'),
+                        'Carrier': row.get('Carrier', ''),
+                        'Service Type': row.get('Service Type', ''),
+                        'Dispute Reason': 'Address correction fee',
+                        'Refund Estimate': address_correction,
+                        'Notes': 'Address correction fees are often disputable'
+                    })
+                
+                # Check for excessive declared value charges
+                if declared_value_charge > 0 and declared_value < 100:
+                    findings.append({
+                        'Error Type': 'Unnecessary Surcharge',
+                        'Tracking Number': row.get('Tracking Number', ''),
+                        'Date': pd.to_datetime(row.get('Shipment Date')).strftime('%Y-%m-%d'),
+                        'Carrier': row.get('Carrier', ''),
+                        'Service Type': row.get('Service Type', ''),
+                        'Dispute Reason': 'Declared value charge on low-value package',
+                        'Refund Estimate': declared_value_charge,
+                        'Notes': f'Declared value: ${declared_value:.2f}'
+                    })
+            
+            except Exception as e:
+                continue
+        
+        return findings
+    
+    def check_disputable_surcharges(self, df: pd.DataFrame) -> List[Dict]:
+        """Check for disputable surcharges based on descriptions from merged surcharge data"""
+        findings = []
+        
+        for index, row in df.iterrows():
+            try:
+                surcharge_details = str(row.get('Surcharge_Details', ''))
+                if not surcharge_details or surcharge_details == 'nan':
+                    continue
+                
+                tracking_num = row.get('Tracking Number', '')
+                ship_date = pd.to_datetime(row.get('Shipment Date'), errors='coerce')
+                carrier = row.get('Carrier', '')
+                service_type = row.get('Service Type', '')
+                
+                # Parse individual surcharges from details string
+                surcharge_items = surcharge_details.split(' | ')
+                
+                # Track surcharges for duplicate detection
+                surcharge_descriptions = []
+                
+                for item in surcharge_items:
+                    if ':' not in item or '$' not in item:
+                        continue
+                        
+                    desc_part, amount_part = item.split(':', 1)
+                    desc = desc_part.strip().upper()
+                    try:
+                        amount = float(amount_part.replace('$', '').strip())
+                    except:
+                        continue
+                    
+                    if amount <= 0:
+                        continue
+                        
+                    # Add to list for duplicate checking
+                    surcharge_descriptions.append(desc)
+                    
+                    # Analyze each surcharge description for disputable charges
+                    dispute_reason = None
+                    refund_estimate = 0
+                    error_type = 'Disputable Surcharge'
+                    
+                    # Check for residential delivery surcharges
+                    if any(keyword in desc for keyword in ['RESIDENTIAL', 'RES DELIVERY', 'RESIDENTIAL DELIVERY']):
+                        # Check if this might be a business address
+                        dest_address = str(row.get('Destination Address', '')).upper()
+                        business_keywords = ['LLC', 'INC', 'CORP', 'COMPANY', 'BUSINESS', 'OFFICE', 'WAREHOUSE', 'STORE', 'SHOP', 'CENTER']
+                        if any(biz_word in dest_address for biz_word in business_keywords):
+                            dispute_reason = 'Residential surcharge applied to business address'
+                            refund_estimate = amount
+                    
+                    # Check for address correction fees (often disputable)
+                    elif any(keyword in desc for keyword in ['ADDRESS CORRECTION', 'ADDR CORRECTION', 'DELIVERY AREA SURCHARGE', 'DAS']):
+                        dispute_reason = 'Address correction or delivery area surcharge - often disputable'
+                        refund_estimate = amount * 0.8  # High chance of successful dispute
+                    
+                    # Check for additional handling charges
+                    elif any(keyword in desc for keyword in ['ADDITIONAL HANDLING', 'ADD HANDLING', 'OVERSIZE', 'LARGE PACKAGE']):
+                        # Check package dimensions to validate - use helper to find dimensions from various column names
+                        length = self._get_dimension(row, 'length')
+                        width = self._get_dimension(row, 'width')
+                        height = self._get_dimension(row, 'height')
+                        
+                        # Sort dimensions to get longest and second longest
+                        dimensions = sorted([length, width, height], reverse=True)
+                        longest_side = dimensions[0]
+                        second_side = dimensions[1]
+                        
+                        # Calculate girth (perimeter around thickest part)
+                        # Girth = 2 * (width + height) assuming length is longest
+                        girth = 2 * (dimensions[1] + dimensions[2])
+                        
+                        # FedEx/UPS additional handling thresholds - if ANY criteria met, charge is valid
+                        # Valid if: Length > 48" OR Second side > 30" OR Length + Girth > 105"
+                        needs_handling = (longest_side > 48 or second_side > 30 or (longest_side + girth) > 105)
+                        
+                        if not needs_handling:
+                            dispute_reason = 'Additional handling charge may not apply to package dimensions'
+                            refund_estimate = amount * 0.6  # Moderate chance of dispute
+                    
+                    # Check for fuel surcharges (if excessive)
+                    elif any(keyword in desc for keyword in ['FUEL', 'FUEL SURCHARGE', 'FSC']):
+                        base_rate = float(row.get('Base Rate', 0) or 0)
+                        if base_rate > 0:
+                            fuel_percentage = (amount / base_rate) * 100
+                            if fuel_percentage > 25:  # Typical fuel surcharges are 10-20%
+                                dispute_reason = f'Fuel surcharge appears excessive at {fuel_percentage:.1f}% of base rate'
+                                refund_estimate = amount * 0.3  # Conservative estimate
+                    
+                    # Check for duplicate or excessive surcharges
+                    elif any(keyword in desc for keyword in ['PEAK', 'HOLIDAY', 'SATURDAY', 'SUNDAY']):
+                        # Check if service type already includes premium service
+                        if any(premium in service_type.upper() for premium in ['OVERNIGHT', 'PRIORITY', 'EXPRESS']):
+                            dispute_reason = 'Peak/holiday surcharge on premium service may be excessive'
+                            refund_estimate = amount * 0.4
+                    
+                    # Check for declared value charges on low-value packages  
+                    elif any(keyword in desc for keyword in ['DECLARED VALUE', 'DV CHARGE', 'INSURANCE']):
+                        declared_value = float(row.get('Declared Value', 0) or 0)
+                        if declared_value < 100:
+                            dispute_reason = f'Declared value charge on low-value package (${declared_value:.2f})'
+                            refund_estimate = amount
+                    
+                    # Add finding if disputable
+                    if dispute_reason:
+                        findings.append({
+                            'Error Type': error_type,
+                            'Tracking Number': tracking_num,
+                            'Date': ship_date.strftime('%Y-%m-%d') if pd.notna(ship_date) else '',
+                            'Carrier': carrier,
+                            'Service Type': service_type,
+                            'Dispute Reason': dispute_reason,
+                            'Refund Estimate': refund_estimate,
+                            'Notes': f'Surcharge: {desc} (${amount:.2f})'
+                        })
+                
+                # Check for duplicate surcharges within the same tracking number
+                from collections import Counter
+                desc_counts = Counter(surcharge_descriptions)
+                for desc, count in desc_counts.items():
+                    if count > 1:
+                        # Find the duplicate items and calculate total amount
+                        duplicate_amount = 0
+                        for item in surcharge_items:
+                            if ':' in item and '$' in item:
+                                item_desc, item_amount = item.split(':', 1)
+                                if item_desc.strip().upper() == desc:
+                                    try:
+                                        duplicate_amount += float(item_amount.replace('$', '').strip())
+                                    except:
+                                        continue
+                        
+                        # Refund estimate is amount of duplicates (keep one occurrence)
+                        refund_estimate = duplicate_amount * (count - 1) / count
+                        
+                        findings.append({
+                            'Error Type': 'Disputable Surcharge',
+                            'Tracking Number': tracking_num,
+                            'Date': ship_date.strftime('%Y-%m-%d') if pd.notna(ship_date) else '',
+                            'Carrier': carrier,
+                            'Service Type': service_type,
+                            'Dispute Reason': f'Duplicate surcharge appears {count} times',
+                            'Refund Estimate': refund_estimate,
+                            'Notes': f'Duplicate surcharge: {desc} (${duplicate_amount:.2f} total)'
+                        })
+            
+            except Exception as e:
+                continue
+        
+        return findings
+    
+    def calculate_summary(self, original_df: pd.DataFrame, findings_df: pd.DataFrame) -> Dict[str, Any]:
+        """Calculate audit summary statistics"""
+        total_charges = original_df['Total Charges'].sum()
+        total_savings = findings_df['Refund Estimate'].sum() if not findings_df.empty else 0
+        affected_shipments = len(findings_df['Tracking Number'].unique()) if not findings_df.empty else 0
+        total_shipments = len(original_df)
+        
+        return {
+            'total_charges': total_charges,
+            'total_savings': total_savings,
+            'affected_shipments': affected_shipments,
+            'total_shipments': total_shipments,
+            'savings_rate': (total_savings / total_charges * 100) if total_charges > 0 else 0,
+            'affected_rate': (affected_shipments / total_shipments * 100) if total_shipments > 0 else 0
+        }
+    
+    def _add_business_days(self, start_date: datetime, business_days: int) -> datetime:
+        """Add business days to a date, skipping weekends"""
+        current_date = start_date
+        days_added = 0
+        
+        while days_added < business_days:
+            current_date += timedelta(days=1)
+            if current_date.weekday() < 5:  # Monday = 0, Sunday = 6
+                days_added += 1
+        
+        return current_date

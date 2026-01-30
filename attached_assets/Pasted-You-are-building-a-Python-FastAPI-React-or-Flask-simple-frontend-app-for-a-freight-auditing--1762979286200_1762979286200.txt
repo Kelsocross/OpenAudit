@@ -1,0 +1,140 @@
+You are building a Python + FastAPI + React (or Flask + simple frontend) app for a freight-auditing workflow. Update the app with the following requirements. Do not break existing features.
+
+Goal
+
+When the user clicks Run Freight Audit, automatically:
+
+Detect and isolate any shipments that include a residential delivery surcharge (RDS).
+
+Route all such shipments to a new page called Residential Delivery Review.
+
+Exclude these shipments from the main audit dashboard counts, charts, and KPIs.
+
+Preserve a clear audit trail so they can be reviewed separately and optionally re-included later.
+
+Data contracts (assume these columns exist; if missing, derive or create)
+
+Primary shipments table includes (from existing app):
+Carrier, OPCO, Service Type, Service Description, Shipment Date, Shipment Delivery Date, Shipment Tracking Number, Shipper Name, Recipient Name, Recipient Company Name, Recipient Address, Recipient City, Recipient State/Province, Recipient Postal Code, Net Charge Amount USD, Pieces In Shipment, Shipment Rated Weight, Original Weight, Shipment DIM Flag (Y or N), Dimmed Height, Dimmed Width, Dimmed Length, Reference Notes Line 1–3, Department Number, PO Number, Pricing Zone
+
+Surcharge lines (detail) or surcharge description field exists (the app already shows “Additional Handling Charge – Dimensions (GND)” etc.). If surcharge lines are in a separate table, they are joined by Shipment Tracking Number (and Shipment Date if needed).
+
+Add two derived fields in the audit pipeline:
+
+has_residential_surcharge (boolean)
+
+residential_surcharge_sources (array/list of matching labels, e.g., ["Residential Surcharge", "Delivery Area Surcharge - Residential"])
+
+Detection logic (configurable, no external API)
+
+Create a case-insensitive pattern list to flag residential surcharges. Match against the surcharge description field (or service description as a fallback).
+
+Default patterns (exact or contains):
+
+"Residential Surcharge"
+
+"Residential Delivery"
+
+"Delivery Area Surcharge - Residential"
+
+"DAS - Residential"
+
+"DAS Residential"
+
+"Home Delivery" (FedEx service implies residential; treat as candidate only—flag if a surcharge line also indicates residential, or if Service Type/Service Description explicitly includes residential wording)
+
+"Address Correction - Residential" (if present)
+
+"Residential Area" / "Residential Area Surcharge"
+
+Make this list editable in a JSON or YAML config (e.g., config/residential_patterns.json) so the user can add new carrier wordings without redeploy.
+
+Rule:
+If any surcharge line for a shipment matches any residential pattern → set has_residential_surcharge = True and collect the matched texts into residential_surcharge_sources.
+
+Pipeline changes (on Run Freight Audit)
+
+Run existing validations and all current checks.
+
+Split the dataset into:
+
+residential_review_df: has_residential_surcharge == True
+
+audited_main_df: everything else (explicitly exclude has_residential_surcharge == True rows)
+
+Persist both in memory and on disk (e.g., /data/audits/{run_id}/audited_main.parquet and /data/audits/{run_id}/residential_review.parquet).
+
+Return both datasets to the frontend in the API response for rendering.
+
+New page: Residential Delivery Review
+
+Add a new nav item: Residential Delivery Review. This page shows only residential_review_df.
+
+UI requirements:
+
+Filters: Date range, Carrier, Customer/Recipient Company, State, Service Type, and a free-text search over Tracking # / Notes.
+
+Summary tiles at top (computed on this subset only):
+
+Count of Residential-flagged shipments
+
+Total Net Charge USD (subset)
+
+Avg Weight and Avg Pieces (subset)
+
+Table with columns:
+Shipment Date, Tracking Number (clickable to carrier tracking URL when possible), Carrier, Service Description, Recipient Company Name, Recipient Address (City/State/ZIP), Net Charge Amount USD, residential_surcharge_sources (comma-separated), Status, Notes
+
+Bulk actions:
+
+Export CSV of the table subset
+
+Set Status (Needs Review, Validated Residential, Misapplied Surcharge, Credited) for selected rows
+
+Row action: “Move back to main audit” checkbox (disabled by default); only enabled when Status is Validated Residential == False and user explicitly confirms re-inclusion. If enabled, it flips a persistent override flag force_include_in_main for that tracking number in a local store (/data/overrides/residential_overrides.json).
+
+Dashboard exclusion
+
+The main audit dashboard (existing charts/KPIs/tables) must consume audited_main_df only, not the full dataset.
+
+All totals, counts, and rates must exclude shipments where has_residential_surcharge == True unless a row has force_include_in_main == True via the override store.
+
+Audit trail
+
+For each run, store a JSON summary under /data/audits/{run_id}/residential_summary.json with:
+
+patterns_used (the active pattern list)
+
+counts and totals for the residential subset
+
+timestamp and file hashes of the input
+
+Keep a light footprint of the first 3 matched surcharge lines per tracking number for quick evidence in the UI.
+
+Config & extensibility
+
+Add a settings panel under Settings → Surcharges where the user can edit the Residential Patterns list (add/remove strings).
+
+Provide a toggle “Treat ‘Home Delivery’ service as residential by default” (default: off). When on, shipments with Service Description containing “Home Delivery” are auto-flagged even without a specific surcharge line.
+
+Acceptance criteria (must pass)
+
+Clicking Run Freight Audit produces two datasets: audited_main_df and residential_review_df.
+
+Main dashboard shows no residential-flagged rows or their amounts in any KPI/chart/table.
+
+Residential Delivery Review page loads, filters work, counts match the residential_review_df.
+
+Export CSV from the Residential page includes exactly the residential subset.
+
+Changing the patterns in Settings and re-running adjusts which shipments are captured, without code changes.
+
+Override force_include_in_main immediately reflects in both pages after refresh/recompute.
+
+Tech notes
+
+Use a simple, side-effect-free matcher: lowercase the description and check any(pattern in desc for pattern in patterns).
+
+If surcharges live in a separate table, aggregate matches per shipment before splitting datasets.
+
+Cache pattern list at startup but allow hot reload on save in Settings.

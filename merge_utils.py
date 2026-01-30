@@ -1,0 +1,141 @@
+import pandas as pd
+import re
+
+# ---------- utilities ----------
+def _norm_str(x):
+    if pd.isna(x): return ""
+    return str(x).strip()
+
+def _norm_tracking(x):
+    s = _norm_str(x)
+    return re.sub(r"[\s-]", "", s).upper()
+
+def _as_money(x):
+    if pd.isna(x) or x == "": return 0.0
+    s = str(x).replace("$", "").replace(",", "").strip()
+    try:
+        return float(s)
+    except:
+        return 0.0
+
+def _rename_if_exists(df, mapping):
+    to_rename = {k: v for k, v in mapping.items() if k in df.columns}
+    return df.rename(columns=to_rename)
+
+def _find_misc_charge_col(df):
+    # Accept "Shipment Miscellaneous ChargeUSD" or "... Charge USD"
+    for col in df.columns:
+        if re.fullmatch(r"Shipment Miscellaneous Charge\s*USD", col):
+            return col
+    # Loose match (handles the no-space version)
+    for col in df.columns:
+        if re.search(r"Shipment\s+Miscellaneous\s+Charge\s*USD", col):
+            return col
+    # Last resort: match fragment
+    for col in df.columns:
+        if "Miscellaneous" in col and "Charge" in col and "USD" in col:
+            return col
+    return None
+
+# ---------- main merge ----------
+def merge_shipments_and_surcharges(ship_df: pd.DataFrame, sur_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge your Summary report with the Surcharge file.
+
+    Summary headers (examples):
+      - Shipment Tracking Number, Master Tracking Number, Invoice Number
+      - Shipment Date (mm/dd/yyyy), Shipment Delivery Date (mm/dd/yyyy)
+      - Net Charge Amount USD, Shipment Miscellaneous Charge USD, etc.
+
+    Surcharge headers:
+      - Carrier, Shipment Date (dd/mm/yyyy), Shipment Tracking Number,
+        Surcharge Description, Shipment Miscellaneous ChargeUSD
+    """
+    # --- Canonicalize known columns ---
+    ship_map = {
+        "Shipment Tracking Number": "Tracking Number",
+        "Master Tracking Number": "Master Tracking Number",
+        "Invoice Number": "Invoice Number",
+        "Net Charge Amount USD": "Total Charges",
+        # Keep native date columns; we don't need them for the join
+    }
+    sur_map = {
+        "Shipment Tracking Number": "Tracking Number",
+        "Surcharge Description": "Surcharge Description",
+        # charge column detected dynamically below
+        "Invoice Number": "Invoice Number",  # in case it exists
+    }
+    ship = _rename_if_exists(ship_df.copy(), ship_map)
+    sur  = _rename_if_exists(sur_df.copy(),  sur_map)
+
+    # --- Build normalized keys ---
+    # Tracking: prefer Shipment Tracking Number; else fall back to Master Tracking Number from ship side
+    if "Tracking Number" in ship.columns:
+        ship["_trk"] = ship["Tracking Number"].map(_norm_tracking)
+    elif "Master Tracking Number" in ship.columns:
+        ship["_trk"] = ship["Master Tracking Number"].map(_norm_tracking)
+    else:
+        ship["_trk"] = ""
+
+    if "Tracking Number" in sur.columns:
+        sur["_trk"] = sur["Tracking Number"].map(_norm_tracking)
+    else:
+        sur["_trk"] = ""
+
+    # Invoice key (optional but preferred)
+    ship["_inv"] = ship["Invoice Number"].map(_norm_str) if "Invoice Number" in ship.columns else ""
+    sur["_inv"]  = sur["Invoice Number"].map(_norm_str)  if "Invoice Number" in sur.columns  else ""
+
+    # Decide join keys using scalars (no ambiguous Series)
+    ship_has_trk = ship["_trk"].ne("").any()
+    sur_has_trk  = sur["_trk"].ne("").any()
+    ship_has_inv = "Invoice Number" in ship.columns and ship["_inv"].ne("").any()
+    sur_has_inv  = "Invoice Number" in sur.columns  and sur["_inv"].ne("").any()
+
+    if ship_has_trk and sur_has_trk and ship_has_inv and sur_has_inv:
+        join_keys = ["_trk", "_inv"]       # best case
+    elif ship_has_trk and sur_has_trk:
+        join_keys = ["_trk"]               # fallback
+    else:
+        # Can't join – return shipments with empty surcharge columns
+        ship["Surcharge_Details"] = ""
+        ship["Additional_Surcharges"] = 0.0
+        return ship
+
+    # --- Prepare surcharge side ---
+    # Locate the amount column even if it's "Shipment Miscellaneous ChargeUSD" (no space)
+    amt_col = _find_misc_charge_col(sur)
+    if amt_col is None:
+        # Try some common alternatives
+        for cand in ["Surcharge Amount", "Amount", "Charge Amount"]:
+            if cand in sur.columns:
+                amt_col = cand
+                break
+    if amt_col is None:
+        # If still nothing, create a zero column so groupby works
+        sur["Surcharge Amount"] = 0.0
+    else:
+        sur["Surcharge Amount"] = sur[amt_col]
+
+    # Clean numeric and description
+    sur["Surcharge Amount"] = sur["Surcharge Amount"].map(_as_money)
+    if "Surcharge Description" not in sur.columns:
+        sur["Surcharge Description"] = ""
+
+    # Build "Label: $X.XX" strings
+    sur["_desc_amt"] = sur.apply(
+        lambda r: f"{_norm_str(r['Surcharge Description'])}: ${_as_money(r['Surcharge Amount']):.2f}", axis=1
+    )
+
+    # Group per join key(s)
+    grp = sur.groupby(join_keys, dropna=False).agg(
+        Additional_Surcharges=("Surcharge Amount", "sum"),
+        Surcharge_Details=("_desc_amt", lambda x: " | ".join([s for s in x if s and s.strip()]))
+    ).reset_index()
+
+    # --- Merge (left) ---
+    merged = ship.merge(grp, on=join_keys, how="left", suffixes=("", "_sur"))
+    merged["Additional_Surcharges"] = merged["Additional_Surcharges"].fillna(0.0)
+    merged["Surcharge_Details"] = merged["Surcharge_Details"].fillna("")
+
+    return merged

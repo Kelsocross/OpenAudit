@@ -1,0 +1,380 @@
+"""
+Contract parsing module for extracting key terms from carrier contracts
+Supports PDF and Excel file formats for rate sheets and master agreements
+"""
+import re
+import pandas as pd
+import pdfplumber
+from typing import Dict, List, Optional, Union, Tuple
+import logging
+from dataclasses import dataclass
+
+@dataclass
+class ContractTerms:
+    """Data structure for extracted contract terms"""
+    base_discount_pct: Optional[float] = None
+    dim_divisor: Optional[int] = None
+    fuel_surcharge_pct: Optional[float] = None
+    residential_surcharge: Optional[float] = None
+    delivery_area_surcharge: Optional[float] = None
+    zone_rates: Optional[Dict[str, float]] = None
+    service_discounts: Optional[Dict[str, float]] = None
+    late_delivery_exclusions: Optional[List[str]] = None
+    contract_type: str = 'rate_sheet'
+    extraction_confidence: float = 0.0
+
+class ContractParser:
+    """Parser for carrier contracts and rate sheets"""
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        
+        # Common patterns for finding contract terms
+        self.discount_patterns = [
+            r'discount[:\s]+(\d+(?:\.\d+)?)\s*%',
+            r'(\d+(?:\.\d+)?)\s*%\s*discount',
+            r'base\s+discount[:\s]+(\d+(?:\.\d+)?)\s*%',
+            r'net\s+discount[:\s]+(\d+(?:\.\d+)?)\s*%'
+        ]
+        
+        self.dim_divisor_patterns = [
+            r'dim(?:ensional)?\s*(?:weight)?\s*divisor[:\s]+(\d+)',
+            r'divisor[:\s]+(\d+)',
+            r'dim\s*factor[:\s]+(\d+)',
+            r'(\d{3})\s*(?:cubic|dim|dimensional)'
+        ]
+        
+        self.fuel_surcharge_patterns = [
+            r'fuel\s*(?:surcharge)?[:\s]+(\d+(?:\.\d+)?)\s*%',
+            r'(\d+(?:\.\d+)?)\s*%\s*fuel',
+            r'fsc[:\s]+(\d+(?:\.\d+)?)\s*%'
+        ]
+        
+        self.residential_patterns = [
+            r'residential[:\s]+\$?(\d+(?:\.\d+)?)',
+            r'res(?:idential)?\s*(?:surcharge)?[:\s]+\$?(\d+(?:\.\d+)?)',
+            r'home\s*delivery[:\s]+\$?(\d+(?:\.\d+)?)'
+        ]
+        
+        self.delivery_area_patterns = [
+            r'(?:extended|delivery)\s*(?:area|delivery)\s*(?:surcharge)?[:\s]+\$?(\d+(?:\.\d+)?)',
+            r'eda[:\s]+\$?(\d+(?:\.\d+)?)',
+            r'rural[:\s]+\$?(\d+(?:\.\d+)?)'
+        ]
+        
+        # Patterns for late delivery refund exclusions
+        self.late_delivery_exclusion_patterns = [
+            r'no\s+(?:refund|compensation|credit)\s+(?:for\s+)?(?:late|delayed)\s+deliver(?:y|ies)',
+            r'late\s+deliver(?:y|ies)\s+(?:are\s+)?not\s+(?:eligible|covered)\s+(?:for\s+)?(?:refund|compensation|credit)',
+            r'(?:refund|compensation|credit)\s+(?:is\s+)?not\s+available\s+(?:for\s+)?(?:late|delayed)\s+deliver(?:y|ies)',
+            r'excludes?\s+(?:late|delayed)\s+deliver(?:y|ies)\s+(?:from\s+)?(?:refund|compensation|credit)',
+            r'(?:late|delayed)\s+deliver(?:y|ies)\s+(?:are\s+)?excluded\s+(?:from\s+)?(?:refund|compensation|credit)',
+            r'no\s+(?:refund|compensation|credit)\s+(?:will\s+be\s+)?(?:provided|given|available)\s+(?:for\s+)?(?:late|delayed)\s+(?:package|shipment|deliver(?:y|ies))',
+            r'(?:late|delayed)\s+(?:package|shipment|deliver(?:y|ies))\s+(?:are\s+)?not\s+(?:refundable|compensated)',
+            r'service\s+(?:guarantee\s+)?(?:does\s+not\s+apply|is\s+void)\s+(?:for\s+)?(?:late|delayed)\s+deliver(?:y|ies)',
+            r'(?:refund|credit|compensation)\s+(?:policy\s+)?(?:does\s+not\s+)?(?:excludes?|does\s+not\s+cover)\s+(?:late|delayed)\s+deliver(?:y|ies)',
+            r'(?:late|delayed)\s+(?:package|shipment|deliver(?:y|ies))\s+(?:will\s+)?not\s+(?:be\s+)?(?:refunded|credited|compensated)'
+        ]
+
+    def parse_contract_file(self, file_content: bytes, file_type: str, filename: str) -> ContractTerms:
+        """
+        Main entry point for parsing contract files
+        
+        Args:
+            file_content: Raw file bytes
+            file_type: File extension (pdf, xlsx, csv)
+            filename: Original filename for context
+            
+        Returns:
+            ContractTerms object with extracted data
+        """
+        try:
+            if file_type.lower() == 'pdf':
+                return self._parse_pdf(file_content)
+            elif file_type.lower() in ['xlsx', 'xls']:
+                return self._parse_excel(file_content)
+            elif file_type.lower() == 'csv':
+                return self._parse_csv(file_content)
+            else:
+                raise ValueError(f"Unsupported file type: {file_type}")
+                
+        except Exception as e:
+            self.logger.error(f"Error parsing {filename}: {str(e)}")
+            return ContractTerms(extraction_confidence=0.0)
+
+    def _parse_pdf(self, file_content: bytes) -> ContractTerms:
+        """Parse PDF contract files"""
+        terms = ContractTerms()
+        extracted_text = ""
+        
+        try:
+            # Extract text from PDF
+            import io
+            pdf_file = io.BytesIO(file_content)
+            
+            with pdfplumber.open(pdf_file) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        extracted_text += page_text + "\n"
+            
+            # Parse text for contract terms
+            terms = self._extract_terms_from_text(extracted_text)
+            
+            # Try to extract tables for zone rates
+            pdf_file.seek(0)  # Reset file pointer
+            with pdfplumber.open(pdf_file) as pdf:
+                tables = []
+                for page in pdf.pages:
+                    page_tables = page.extract_tables()
+                    if page_tables:
+                        tables.extend(page_tables)
+                
+                zone_rates = self._extract_zone_rates_from_tables(tables)
+                if zone_rates:
+                    terms.zone_rates = zone_rates
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing PDF: {str(e)}")
+            return ContractTerms(extraction_confidence=0.0)
+            
+        return terms
+
+    def _parse_excel(self, file_content: bytes) -> ContractTerms:
+        """Parse Excel contract files"""
+        terms = ContractTerms()
+        
+        try:
+            import io
+            excel_file = io.BytesIO(file_content)
+            
+            # Read all sheets
+            excel_data = pd.read_excel(excel_file, sheet_name=None)
+            
+            # Extract terms from each sheet
+            all_text = ""
+            for sheet_name, df in excel_data.items():
+                # Convert DataFrame to string for text analysis
+                all_text += df.to_string() + "\n"
+                
+                # Look for zone rate patterns in structured data
+                zone_rates = self._extract_zone_rates_from_dataframe(df)
+                if zone_rates and not terms.zone_rates:
+                    terms.zone_rates = zone_rates
+            
+            # Parse combined text for contract terms
+            terms_from_text = self._extract_terms_from_text(all_text)
+            
+            # Merge results
+            for field in ['base_discount_pct', 'dim_divisor', 'fuel_surcharge_pct', 
+                         'residential_surcharge', 'delivery_area_surcharge', 'late_delivery_exclusions']:
+                if not getattr(terms, field) and getattr(terms_from_text, field):
+                    setattr(terms, field, getattr(terms_from_text, field))
+            
+            terms.extraction_confidence = terms_from_text.extraction_confidence
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing Excel: {str(e)}")
+            return ContractTerms(extraction_confidence=0.0)
+            
+        return terms
+
+    def _parse_csv(self, file_content: bytes) -> ContractTerms:
+        """Parse CSV rate files"""
+        terms = ContractTerms()
+        
+        try:
+            import io
+            csv_file = io.StringIO(file_content.decode('utf-8'))
+            df = pd.read_csv(csv_file)
+            
+            # Convert to text and extract terms
+            text_content = df.to_string()
+            terms = self._extract_terms_from_text(text_content)
+            
+            # Look for zone rates in structured data
+            zone_rates = self._extract_zone_rates_from_dataframe(df)
+            if zone_rates:
+                terms.zone_rates = zone_rates
+                
+        except Exception as e:
+            self.logger.error(f"Error parsing CSV: {str(e)}")
+            return ContractTerms(extraction_confidence=0.0)
+            
+        return terms
+
+    def _extract_terms_from_text(self, text: str) -> ContractTerms:
+        """Extract contract terms from text using regex patterns"""
+        terms = ContractTerms()
+        text_lower = text.lower()
+        confidence_score = 0.0
+        total_checks = 6  # Updated to include late delivery exclusions
+        
+        # Extract base discount
+        for pattern in self.discount_patterns:
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
+                terms.base_discount_pct = float(match.group(1))
+                confidence_score += 1
+                break
+        
+        # Extract DIM divisor
+        for pattern in self.dim_divisor_patterns:
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
+                divisor = int(match.group(1))
+                # Common DIM divisors are 139, 166, 194
+                if divisor in [139, 166, 194, 250]:
+                    terms.dim_divisor = divisor
+                    confidence_score += 1
+                    break
+        
+        # Extract fuel surcharge
+        for pattern in self.fuel_surcharge_patterns:
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
+                terms.fuel_surcharge_pct = float(match.group(1))
+                confidence_score += 1
+                break
+        
+        # Extract residential surcharge
+        for pattern in self.residential_patterns:
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
+                terms.residential_surcharge = float(match.group(1))
+                confidence_score += 1
+                break
+        
+        # Extract delivery area surcharge
+        for pattern in self.delivery_area_patterns:
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
+                terms.delivery_area_surcharge = float(match.group(1))
+                confidence_score += 1
+                break
+        
+        # Extract late delivery exclusions
+        late_delivery_exclusions = []
+        for pattern in self.late_delivery_exclusion_patterns:
+            matches = re.finditer(pattern, text_lower, re.IGNORECASE)
+            for match in matches:
+                # Find the sentence or clause containing the match
+                start = max(0, text_lower.rfind('.', 0, match.start()) + 1)
+                end = text_lower.find('.', match.end())
+                if end == -1:
+                    end = len(text_lower)
+                clause = text[start:end].strip()
+                if clause and clause not in late_delivery_exclusions:
+                    late_delivery_exclusions.append(clause)
+        
+        if late_delivery_exclusions:
+            terms.late_delivery_exclusions = late_delivery_exclusions
+            confidence_score += 1
+        
+        terms.extraction_confidence = confidence_score / total_checks
+        return terms
+
+    def _extract_zone_rates_from_tables(self, tables: List[List[List]]) -> Optional[Dict[str, float]]:
+        """Extract zone-based rates from PDF tables"""
+        zone_rates = {}
+        
+        for table in tables:
+            if not table:
+                continue
+                
+            try:
+                # Convert table to DataFrame for easier processing
+                df = pd.DataFrame(table[1:], columns=table[0] if table[0] else None)
+                
+                # Look for zone columns and rate columns
+                zone_cols = [col for col in df.columns if col and 'zone' in str(col).lower()]
+                rate_cols = [col for col in df.columns if col and 
+                           any(term in str(col).lower() for term in ['rate', 'price', '$', 'cost'])]
+                
+                if zone_cols and rate_cols:
+                    for _, row in df.iterrows():
+                        zone = str(row[zone_cols[0]]) if zone_cols[0] in row else None
+                        rate = row[rate_cols[0]] if rate_cols[0] in row else None
+                        
+                        if zone and rate:
+                            try:
+                                # Clean up rate value
+                                rate_clean = re.sub(r'[^\d\.]', '', str(rate))
+                                if rate_clean:
+                                    zone_rates[zone] = float(rate_clean)
+                            except ValueError:
+                                continue
+                                
+            except Exception as e:
+                self.logger.debug(f"Error processing table: {str(e)}")
+                continue
+        
+        return zone_rates if zone_rates else None
+
+    def _extract_zone_rates_from_dataframe(self, df: pd.DataFrame) -> Optional[Dict[str, float]]:
+        """Extract zone rates from structured DataFrame"""
+        zone_rates = {}
+        
+        try:
+            # Look for zone columns
+            zone_cols = [col for col in df.columns if 'zone' in str(col).lower()]
+            rate_cols = [col for col in df.columns if 
+                        any(term in str(col).lower() for term in ['rate', 'price', '$', 'cost'])]
+            
+            if zone_cols and rate_cols:
+                for _, row in df.iterrows():
+                    zone = str(row[zone_cols[0]])
+                    rate_val = row[rate_cols[0]]
+                    
+                    if pd.notna(rate_val):
+                        try:
+                            # Clean up rate value
+                            if isinstance(rate_val, str):
+                                rate_clean = re.sub(r'[^\d\.]', '', rate_val)
+                                if rate_clean:
+                                    zone_rates[zone] = float(rate_clean)
+                            else:
+                                zone_rates[zone] = float(rate_val)
+                        except (ValueError, TypeError):
+                            continue
+            
+        except Exception as e:
+            self.logger.debug(f"Error extracting zone rates from DataFrame: {str(e)}")
+            return None
+            
+        return zone_rates if zone_rates else None
+
+    def validate_extracted_terms(self, terms: ContractTerms) -> Dict[str, str]:
+        """Validate extracted terms for reasonableness"""
+        validation_issues = {}
+        
+        # Validate discount percentage
+        if terms.base_discount_pct:
+            if terms.base_discount_pct < 0 or terms.base_discount_pct > 80:
+                validation_issues['base_discount_pct'] = "Discount percentage seems unrealistic (0-80% expected)"
+        
+        # Validate DIM divisor
+        if terms.dim_divisor:
+            if terms.dim_divisor not in [139, 166, 194, 250]:
+                validation_issues['dim_divisor'] = "Unusual DIM divisor (common values: 139, 166, 194, 250)"
+        
+        # Validate fuel surcharge
+        if terms.fuel_surcharge_pct:
+            if terms.fuel_surcharge_pct < 0 or terms.fuel_surcharge_pct > 50:
+                validation_issues['fuel_surcharge_pct'] = "Fuel surcharge seems unrealistic (0-50% expected)"
+        
+        # Validate residential surcharge
+        if terms.residential_surcharge:
+            if terms.residential_surcharge < 0 or terms.residential_surcharge > 20:
+                validation_issues['residential_surcharge'] = "Residential surcharge seems unrealistic ($0-20 expected)"
+        
+        # Validate late delivery exclusions
+        if terms.late_delivery_exclusions:
+            if len(terms.late_delivery_exclusions) > 10:
+                validation_issues['late_delivery_exclusions'] = "Unusually high number of late delivery exclusion clauses found"
+        
+        return validation_issues
+
+def get_contract_parser():
+    """Factory function to get contract parser instance"""
+    return ContractParser()
