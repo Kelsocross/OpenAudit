@@ -369,7 +369,7 @@ def main():
                 "Warehouse Addresses (one per line)",
                 value="\n".join(st.session_state.warehouse_addresses),
                 height=100,
-                placeholder="Example:\n251 Gillum Dr\n1409 Coronet Dr\n123 Main Street",
+                placeholder="Example:\n567 Lawerance Dr\n123 Main Street",
                 help="Enter your warehouse or distribution center addresses. Shipments FROM these addresses will be classified as Outbound."
             )
             
